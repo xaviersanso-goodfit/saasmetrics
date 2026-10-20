@@ -1198,90 +1198,154 @@ $('fxIn').addEventListener('keydown',e=>{ if(e.key==='Enter') e.target.blur(); }
 /* ---------- excel export ---------- */
 function exportExcel(){
   if(!MET||MET.empty){ toast('Nothing to export yet.',true); return; }
-  const fmt='#,##0;(#,##0);"-"';
+  /* Formula export. Every monetary figure is written as its GBP ledger value times the named cell FX
+     (Scope!B5, the plan rate, 1 in the GBP view), and every derived figure (net new, closing, ARR, ARPA,
+     growth and churn rates, deferred, totals) is a formula over those cells. Change FX in the workbook
+     and everything recomputes. The portal keeps the display-currency values as the cached results. */
+  const fmt='#,##0;(#,##0);"-"', pf='0.0%;(0.0%);"-"';
+  const fx=fxFactor(), g=v=>round2((Number(v)||0)/fx);   // back to the GBP ledger value
+  const A=(r,c)=>XLSX.utils.encode_cell({r,c});          // 0-based row and column to A1
+  const put=(ws,r,c,cell)=>{ ws[A(r,c)]=cell; };
+  const money=(ws,r,c,gbp)=>put(ws,r,c,{t:'n',f:g(gbp)+'*FX',v:g(gbp)*fx,z:fmt});
+  const formula=(ws,r,c,f,v,z)=>put(ws,r,c,{t:'n',f,v:(v==null||!isFinite(v))?0:v,z:z||fmt});
+  const txt=(ws,r,c,s)=>put(ws,r,c,{t:'s',v:s});
+  const num=(ws,r,c,v)=>put(ws,r,c,{t:'n',v});
+  const setRange=(ws,rows,cols)=>{ ws['!ref']=A(0,0)+':'+A(rows-1,cols-1); };
   const wb=XLSX.utils.book_new();
-  wb.Props={Title:'GoodFit SaaS metrics', Author:'Xavier Sanso', Company:'GoodFit Limited',
-    LastAuthor:'Xavier Sanso', CreatedDate:new Date()};
-  // MRR walk sheet
-  const head=['Month','Opening MRR','New','Expansion','Reactivation','Contraction','Churn','Net new','Closing MRR','Closing ARR','Customers'];
-  const aoa=[
-    ['GoodFit Limited'],['SaaS metrics \u00B7 monthly MRR walk \u00B7 '+ccyLabel()],
-    ['Method: recurring lines amortised over term, month-end snapshot, ChartMogul basis'],[],
-    head
-  ];
-  MET.walk.forEach(r=>aoa.push([ymLabel(r.key), r.open==null?null:r.open, r.nb,r.ex,r.re,r.ct,r.ch,r.net,r.close,r.close*12,r.cust]));
-  const ws=XLSX.utils.aoa_to_sheet(aoa);
+  wb.Props={Title:'GoodFit SaaS metrics', Author:'Xavier Sanso', Company:'GoodFit Limited', LastAuthor:'Xavier Sanso', CreatedDate:new Date()};
+  wb.Workbook={Names:[{Name:'FX',Ref:'Scope!$B$5'}]};
+  const W=MET.walk, n=W.length, R0=5;   // walk data starts on sheet row 6 (index 5)
+
+  // ---- MRR walk: components are ledger values times FX; net new, closing and ARR are formulas ----
+  const ws={};
+  txt(ws,0,0,'GoodFit Limited'); txt(ws,1,0,'SaaS metrics · monthly MRR walk · '+ccyLabel());
+  txt(ws,2,0,'Method: recurring lines amortised over term, month-end snapshot, ChartMogul basis. Monetary cells are GBP ledger values times the FX cell on the Scope sheet.');
+  ['Month','Opening MRR','New','Expansion','Reactivation','Contraction','Churn','Net new','Closing MRR','Closing ARR','Customers'].forEach((h,i)=>txt(ws,4,i,h));
+  W.forEach((r,i)=>{ const row=R0+i, x=row+1;
+    txt(ws,row,0,ymLabel(r.key));
+    if(i===0){ put(ws,row,1,{t:'z'}); } else formula(ws,row,1,'I'+row, W[i-1].close);
+    money(ws,row,2,r.nb); money(ws,row,3,r.ex); money(ws,row,4,r.re); money(ws,row,5,r.ct); money(ws,row,6,r.ch);
+    formula(ws,row,7,'SUM(C'+x+':G'+x+')', r.net);
+    if(i===0) money(ws,row,8,r.close); else formula(ws,row,8,'B'+x+'+H'+x, r.close);
+    formula(ws,row,9,'I'+x+'*12', r.close*12);
+    num(ws,row,10,r.cust);
+  });
+  setRange(ws,R0+n,11);
   ws['!cols']=[{wch:14},{wch:13},{wch:11},{wch:12},{wch:13},{wch:13},{wch:11},{wch:11},{wch:13},{wch:13},{wch:10}];
-  applyFmt(ws,5,aoa.length, [1,2,3,4,5,6,7,8,9], fmt);
   XLSX.utils.book_append_sheet(wb,ws,'MRR walk');
-  // snapshot sheet
-  const s2=[['Month','MRR','ARR','Customers','Subscriptions','ARPA']];
-  MET.walk.forEach((r,i)=>s2.push([ymLabel(r.key), r.close, r.close*12, r.cust, (MET.counts&&MET.counts[i]?MET.counts[i].subs:null), r.cust?r.close/r.cust:0]));
-  const ws2=XLSX.utils.aoa_to_sheet(s2); ws2['!cols']=[{wch:14},{wch:12},{wch:13},{wch:11},{wch:13},{wch:11}];
-  applyFmt(ws2,1,s2.length,[1,2,5],fmt);
+
+  // ---- Monthly snapshot: references the walk ----
+  const ws2={};
+  ['Month','MRR','ARR','Customers','Subscriptions','ARPA'].forEach((h,i)=>txt(ws2,0,i,h));
+  W.forEach((r,i)=>{ const row=1+i, x=row+1, wr=R0+i+1;
+    txt(ws2,row,0,ymLabel(r.key));
+    formula(ws2,row,1,"'MRR walk'!I"+wr, r.close);
+    formula(ws2,row,2,'B'+x+'*12', r.close*12);
+    formula(ws2,row,3,"'MRR walk'!K"+wr, r.cust, '0');
+    num(ws2,row,4,(MET.counts&&MET.counts[i]?MET.counts[i].subs:null));
+    formula(ws2,row,5,'IF(D'+x+'>0,B'+x+'/D'+x+',0)', r.cust?r.close/r.cust:0);
+  });
+  setRange(ws2,1+n,6);
+  ws2['!cols']=[{wch:14},{wch:12},{wch:13},{wch:11},{wch:13},{wch:11}];
   XLSX.utils.book_append_sheet(wb,ws2,'Monthly snapshot');
-  // growth and churn rates
+
+  // ---- Growth and churn: rates as formulas over the walk ----
   if(MET._rates){
-    const R=MET._rates, pf='0.0%;(0.0%);"-"';
-    const head=['Month','MRR MoM growth','Gross dollar churn (monthly)','Net dollar churn (monthly)','Gross dollar churn (annualized)','Net dollar churn (annualized)'];
-    const aoa=[['GoodFit Limited'],['Growth and churn rates \u00B7 monthly \u00B7 '+CCY+' basis'],
-      ['Churn is share of opening MRR. Annualized as one minus (one minus monthly) to the power twelve.'],[],head];
-    R.keys.forEach((k,i)=>aoa.push([ymLabel(k), R.mom[i], R.grossM[i], R.netM[i], R.grossA[i], R.netA[i]]));
-    const ws=XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols']=[{wch:14},{wch:17},{wch:26},{wch:26},{wch:28},{wch:28}];
-    for(let r=5;r<aoa.length;r++) for(const c of [1,2,3,4,5]){
-      const ad=XLSX.utils.encode_cell({r,c}), cell=ws[ad];
-      if(cell&&typeof cell.v==='number'){ cell.z=pf; cell.t='n'; }
-    }
-    XLSX.utils.book_append_sheet(wb,ws,'Growth and churn');
+    const Rt=MET._rates, ws3={};
+    txt(ws3,0,0,'GoodFit Limited'); txt(ws3,1,0,'Growth and churn rates · monthly · '+CCY+' basis');
+    txt(ws3,2,0,'Churn is share of opening MRR. Annualized as one minus (one minus monthly) to the power twelve. Rates are independent of the FX cell.');
+    ['Month','MRR MoM growth','Gross dollar churn (monthly)','Net dollar churn (monthly)','Gross dollar churn (annualized)','Net dollar churn (annualized)'].forEach((h,i)=>txt(ws3,4,i,h));
+    W.forEach((r,i)=>{ const row=4+1+i, x=row+1, w="'MRR walk'!", wr=R0+i+1;
+      txt(ws3,row,0,ymLabel(r.key));
+      if(i===0||r.open==null||r.open<=0.5){ for(let c=1;c<=5;c++) put(ws3,row,c,{t:'z'}); return; }
+      const O=w+'B'+wr, EX=w+'D'+wr, RE=w+'E'+wr, CT=w+'F'+wr, CH=w+'G'+wr, NN=w+'H'+wr;
+      formula(ws3,row,1,NN+'/'+O, Rt.mom[i], pf);
+      formula(ws3,row,2,'(-'+CH+'-'+CT+')/'+O, Rt.grossM[i], pf);
+      formula(ws3,row,3,'(-'+CH+'-'+CT+'-'+EX+'-'+RE+')/'+O, Rt.netM[i], pf);
+      formula(ws3,row,4,'1-(1-C'+x+')^12', Rt.grossA[i], pf);
+      formula(ws3,row,5,'1-(1-D'+x+')^12', Rt.netA[i], pf);
+    });
+    setRange(ws3,5+n,6);
+    ws3['!cols']=[{wch:14},{wch:17},{wch:26},{wch:26},{wch:28},{wch:28}];
+    XLSX.utils.book_append_sheet(wb,ws3,'Growth and churn');
   }
-  // customer MRR latest
+
+  // ---- Customer MRR at the latest month end ----
   const dlast=eom(...MET.months[MET.months.length-1]);
   const byc={}; MET.subs.forEach(s=>{ if(s.s<=dlast&&dlast<s.e) byc[s.c]=(byc[s.c]||0)+s.mrr; });
-  const s3=[['Customer','MRR','ARR']]; Object.entries(byc).sort((a,b)=>b[1]-a[1]).forEach(([c,v])=>s3.push([c,v,v*12]));
-  const ws3=XLSX.utils.aoa_to_sheet(s3); ws3['!cols']=[{wch:34},{wch:12},{wch:13}];
-  applyFmt(ws3,1,s3.length,[1,2],fmt);
-  XLSX.utils.book_append_sheet(wb,ws3,'Customer MRR');
-  // revenue by client and month: billed / recognized / deferred
+  const cl=Object.entries(byc).sort((a,b)=>b[1]-a[1]);
+  const ws4={}; ['Customer','MRR','ARR'].forEach((h,i)=>txt(ws4,0,i,h));
+  cl.forEach(([c,v],i)=>{ const row=1+i, x=row+1; txt(ws4,row,0,c); money(ws4,row,1,v); formula(ws4,row,2,'B'+x+'*12', v*12); });
+  const tr=1+cl.length;
+  txt(ws4,tr,0,'Total'); formula(ws4,tr,1,'SUM(B2:B'+tr+')', MET.mrr); formula(ws4,tr,2,'SUM(C2:C'+tr+')', MET.mrr*12);
+  setRange(ws4,tr+1,3); ws4['!cols']=[{wch:34},{wch:12},{wch:13}];
+  XLSX.utils.book_append_sheet(wb,ws4,'Customer MRR');
+
+  // ---- Revenue by client: billed and recognised as ledger values times FX, deferred as billed less recognised ----
   if(MET.rev){
-    const R=MET.rev, mk=R.monthKeys;
-    const modes=[['total','Billed by client'],['recog','Recognized by client'],['defer','Deferred by client']];
-    const prevMode=revMode;
-    modes.forEach(([m,name])=>{
-      revMode=m;
-      const rowTot={}; R.clients.forEach(c=>{ rowTot[c]=mk.reduce((a,k)=>a+revCell(R.billed,R.recog,c,k),0); });
-      const cl=R.clients.filter(c=>mk.some(k=>Math.abs(revCell(R.billed,R.recog,c,k))>=0.5))
-        .sort((a,b)=>Math.abs(rowTot[b])-Math.abs(rowTot[a]));
-      const head=['Customer',...mk.map(ymLabel),'Total'];
-      const typ={both:'recurring and non-recurring', rec:'recurring only', non:'non-recurring only'}[revType];
-      const aoa=[['GoodFit Limited'],[name+' \u00B7 '+typ+' \u00B7 '+CCY+' ex VAT \u00B7 '+ymLabel(mk[0])+' to '+ymLabel(mk[mk.length-1])],[],head];
-      cl.forEach(c=>{ aoa.push([c,...mk.map(k=>round2(revCell(R.billed,R.recog,c,k))),round2(rowTot[c])]); });
-      const totRow=['Total',...mk.map(k=>round2(cl.reduce((a,c)=>a+revCell(R.billed,R.recog,c,k),0))),
-        round2(cl.reduce((a,c)=>a+rowTot[c],0))];
-      aoa.push(totRow);
-      const ws=XLSX.utils.aoa_to_sheet(aoa);
-      ws['!cols']=[{wch:32},...mk.map(()=>({wch:11})),{wch:13}];
-      const cols=mk.map((_,i)=>i+1); cols.push(mk.length+1);
-      applyFmt(ws,4,aoa.length,cols,fmt);
-      XLSX.utils.book_append_sheet(wb,ws,name);
-    });
-    revMode=prevMode;
+    const Rv=MET.rev, mk=Rv.monthKeys, m=mk.length;
+    const typ={both:'recurring and non-recurring', rec:'recurring only', non:'non-recurring only'}[revType];
+    const bil=c=>mk.map(k=>revVal(Rv.billed,c,k)), rec=c=>mk.map(k=>revVal(Rv.recog,c,k));
+    // one client list, same order on all three sheets, so the deferred sheet can reference by position
+    const clients=Rv.clients.filter(c=>bil(c).some(v=>Math.abs(v)>=0.5)||rec(c).some(v=>Math.abs(v)>=0.5))
+      .sort((a,b)=>Math.abs(bil(b).reduce((s,v)=>s+v,0))-Math.abs(bil(a).reduce((s,v)=>s+v,0)));
+    const H0=3, D0=4, totCol=m+1, totRow=D0+clients.length;
+    const colL=c=>XLSX.utils.encode_col(c);
+    const sheet=(name,fill)=>{
+      const s={}; txt(s,0,0,'GoodFit Limited');
+      txt(s,1,0,name+' · '+typ+' · '+CCY+' ex VAT · '+ymLabel(mk[0])+' to '+ymLabel(mk[m-1]));
+      txt(s,H0,0,'Customer'); mk.forEach((k,j)=>txt(s,H0,1+j,ymLabel(k))); txt(s,H0,totCol,'Total');
+      clients.forEach((c,i)=>{ const row=D0+i, x=row+1; txt(s,row,0,c);
+        fill(s,row,c,x);
+        formula(s,row,totCol,'SUM(B'+x+':'+colL(m)+x+')', null);
+      });
+      txt(s,totRow,0,'Total');
+      for(let j=1;j<=totCol;j++) formula(s,totRow,j,'SUM('+colL(j)+(D0+1)+':'+colL(j)+totRow+')', null);
+      setRange(s,totRow+1,totCol+1);
+      s['!cols']=[{wch:32},...mk.map(()=>({wch:11})),{wch:13}];
+      return s;
+    };
+    const wsB=sheet('Billed by client',(s,row,c)=>{ bil(c).forEach((v,j)=>money(s,row,1+j,v)); });
+    const wsR=sheet('Recognized by client',(s,row,c)=>{ rec(c).forEach((v,j)=>money(s,row,1+j,v)); });
+    const wsD=sheet('Deferred by client',(s,row,c,x)=>{ const b=bil(c), r=rec(c);
+      mk.forEach((k,j)=>formula(s,row,1+j,"'Billed by client'!"+colL(1+j)+x+"-'Recognized by client'!"+colL(1+j)+x, b[j]-r[j])); });
+    // cached totals so viewers that do not recalculate still show figures
+    const cache=(s,vals)=>{ clients.forEach((c,i)=>{ const row=D0+i, t=vals(c).reduce((a,v)=>a+v,0); s[A(row,totCol)].v=t; });
+      for(let j=1;j<=m;j++){ s[A(totRow,j)].v=clients.reduce((a,c)=>a+vals(c)[j-1],0); }
+      s[A(totRow,totCol)].v=clients.reduce((a,c)=>a+vals(c).reduce((x,v)=>x+v,0),0); };
+    cache(wsB,bil); cache(wsR,rec); cache(wsD,c=>bil(c).map((v,j)=>v-rec(c)[j]));
+    XLSX.utils.book_append_sheet(wb,wsB,'Billed by client');
+    XLSX.utils.book_append_sheet(wb,wsR,'Recognized by client');
+    XLSX.utils.book_append_sheet(wb,wsD,'Deferred by client');
   }
-  // scope sheet
-  const s4=[['Scope and billings ('+CCY+')'],[],
-    ['Currency', ccyLabel()],
-    ['Recurring billed', MET.recBill],['Non-recurring billed', MET.nonRecBill],
-    ['Total billed', MET.recBill+MET.nonRecBill],['Closing MRR', MET.mrr],['Closing ARR', MET.mrr*12],
-    ['Active customers', MET.custCount],['Active subscriptions', MET.activeLines],
-    ['Lines in scope', MET.lineCount],['Recurring lines without dates', MET.missingDates],
-    ['Credit-note lines', MET.creditNotes],[],['Coverage', ymLabel(MET.first)+' to '+ymLabel(MET.last)]];
-  Object.entries(MET.excl||{}).forEach(([k,v])=>s4.push(['Excluded \u00B7 '+k, v]));
-  const ws4=XLSX.utils.aoa_to_sheet(s4); ws4['!cols']=[{wch:30},{wch:14}];
-  applyFmt(ws4,1,s4.length,[1],fmt);
-  XLSX.utils.book_append_sheet(wb,ws4,'Scope');
+
+  // ---- Scope: holds the FX input cell that every monetary formula points at ----
+  const ws5={}, lastWalk=R0+n;   // sheet row number of the last walk row
+  txt(ws5,0,0,'Scope and billings ('+CCY+')');
+  txt(ws5,2,0,'Ledger currency'); txt(ws5,2,1,'GBP');
+  txt(ws5,3,0,'Display currency'); txt(ws5,3,1,CCY);
+  txt(ws5,4,0,'FX rate, GBP to display currency (input: change it and the workbook recomputes)'); put(ws5,4,1,{t:'n',v:fx,z:'0.0000'});
+  txt(ws5,5,0,'Currency note'); txt(ws5,5,1,ccyLabel());
+  const rows=[['Recurring billed',(s,r)=>money(s,r,1,MET.recBill)],['Non-recurring billed',(s,r)=>money(s,r,1,MET.nonRecBill)],
+    ['Total billed',null],
+    ['Closing MRR',(s,r)=>formula(s,r,1,"'MRR walk'!I"+lastWalk, MET.mrr)],['Closing ARR',null],
+    ['Active customers',(s,r)=>num(s,r,1,MET.custCount)],['Active subscriptions',(s,r)=>num(s,r,1,MET.activeLines)],
+    ['Lines in scope',(s,r)=>num(s,r,1,MET.lineCount)],['Recurring lines without dates',(s,r)=>num(s,r,1,MET.missingDates)],
+    ['Credit-note lines',(s,r)=>num(s,r,1,MET.creditNotes)]];
+  let r=7;
+  rows.forEach(([lab,fn],i)=>{ txt(ws5,r,0,lab);
+    if(lab==='Total billed') formula(ws5,r,1,'B'+(r-1)+'+B'+r, MET.recBill+MET.nonRecBill);
+    else if(lab==='Closing ARR') formula(ws5,r,1,'B'+r+'*12', MET.mrr*12);
+    else fn(ws5,r);
+    r++; });
+  r++; txt(ws5,r,0,'Coverage'); txt(ws5,r,1,ymLabel(MET.first)+' to '+ymLabel(MET.last)); r++;
+  Object.entries(MET.excl||{}).forEach(([k,v])=>{ txt(ws5,r,0,'Excluded · '+k); num(ws5,r,1,v); r++; });
+  setRange(ws5,r,2); ws5['!cols']=[{wch:70},{wch:16}];
+  XLSX.utils.book_append_sheet(wb,ws5,'Scope');
+
   const fname='GoodFit_SaaS_Metrics_'+MET.last+(CCY==='USD'?'_USD':'')+'.xlsx';
   XLSX.writeFile(wb,fname);
-  toast('Exported '+fname);
+  toast('Exported '+fname+' (formula workbook, FX cell on the Scope sheet)');
 }
 function ccyLabel(){ return CCY==='USD' ? 'USD, translated from the GBP ledger at 1 GBP = '+FX+' USD' : 'GBP'; }
 function applyFmt(ws,startRow,endRow,cols,fmt){
