@@ -1203,7 +1203,7 @@ function exportExcel(){
      growth and churn rates, deferred, totals) is a formula over those cells. Change FX in the workbook
      and everything recomputes. The portal keeps the display-currency values as the cached results. */
   const fmt='#,##0;(#,##0);"-"', pf='0.0%;(0.0%);"-"';
-  const fx=fxFactor(), g=v=>round2((Number(v)||0)/fx);   // back to the GBP ledger value
+  const fx=fxFactor(), g=v=>Math.round((Number(v)||0)/fx*1e6)/1e6;   // back to the GBP ledger value, six decimals so amortised cells foot exactly
   const A=(r,c)=>XLSX.utils.encode_cell({r,c});          // 0-based row and column to A1
   const put=(ws,r,c,cell)=>{ ws[A(r,c)]=cell; };
   const money=(ws,r,c,gbp)=>put(ws,r,c,{t:'n',f:g(gbp)+'*FX',v:g(gbp)*fx,z:fmt});
@@ -1317,6 +1317,61 @@ function exportExcel(){
     XLSX.utils.book_append_sheet(wb,wsB,'Billed by client');
     XLSX.utils.book_append_sheet(wb,wsR,'Recognized by client');
     XLSX.utils.book_append_sheet(wb,wsD,'Deferred by client');
+
+    // ---- Revenue schedule: one row per invoice line, amortised across the months it covers ----
+    // Recurring lines: net divided by the term in whole months, one cell per month from the start month.
+    // Non-recurring or undated lines: the whole net in the invoice month. Months before the coverage window
+    // go to the Outside coverage column so every row still foots to its net. The month totals tie to the
+    // Recognized by client sheet and the net column ties to Billed by client.
+    const wsS={}, F0=5, C0=11;   // first data row index, first month column index
+    const lines=allLines().filter(l=>clientPasses(l.contact)&&INCLUDE.has(l.status)&&Math.abs(Number(l.net)||0)>=0.005)
+      .filter(l=> revType==='both' || (revType==='rec' ? l.rec==='Recurring' : l.rec!=='Recurring'))
+      .sort((a,b)=> (a.date||'').localeCompare(b.date||'') || String(a.inv).localeCompare(String(b.inv)));
+    txt(wsS,0,0,'GoodFit Limited');
+    txt(wsS,1,0,'Revenue schedule \u00B7 how billed revenue becomes recognised revenue and MRR \u00B7 '+typ+' \u00B7 '+CCY+' ex VAT');
+    txt(wsS,2,0,'Recurring lines are spread evenly over their term (net divided by whole months from start to end, half-open); each month cell is that line\'s contribution to the month\'s recognised revenue and MRR. Non-recurring and undated lines are recognised in the invoice month.');
+    ['Invoice','Invoice date','Customer','Description','Type','Status','Start','End','Term (months)','Net billed','Outside coverage'].forEach((hd,i)=>txt(wsS,4,i,hd));
+    mk.forEach((k,j)=>txt(wsS,4,C0+j,ymLabel(k))); txt(wsS,4,C0+m,'Total');
+    const mIdx={}; mk.forEach((k,j)=>mIdx[k]=j);
+    const dcell=(s,r,c,iso)=>{ if(!iso){ put(s,r,c,{t:'z'}); return; } put(s,r,c,{t:'d',v:new Date(iso+'T00:00:00Z'),z:'dd/mm/yyyy'}); };
+    const colNet='J', colOut='K';
+    const moneyG=(s,r,c,gbp)=>put(s,r,c,{t:'n',f:round2(gbp)+'*FX',v:round2(gbp)*fx,z:fmt});   // ledger GBP in, display currency cached
+    lines.forEach((l,i)=>{ const row=F0+i, x=row+1, net=(Number(l.net)||0), netD=net*fx;
+      const s=parseDate(l.start), e=parseDate(l.end), isRec=l.rec==='Recurring', bm=ymKey(parseDate(l.date));
+      txt(wsS,row,0,String(l.inv||'')); dcell(wsS,row,1,l.date); txt(wsS,row,2,l.contact||'(no contact)'); txt(wsS,row,3,l.desc||'');
+      txt(wsS,row,4,isRec?'Recurring':'Non-recurring'); txt(wsS,row,5,l.status); dcell(wsS,row,6,l.start); dcell(wsS,row,7,l.end);
+      moneyG(wsS,row,9,net);
+      let outside=0;
+      if(isRec&&s&&e){
+        const tm=termMonths(s,e), m0=ymKey(s); num(wsS,row,8,tm);
+        let outN=0;
+        for(let j=0;j<tm;j++){ const k=addMonths(m0,j); if(mIdx[k]!=null) formula(wsS,row,C0+mIdx[k],'$'+colNet+x+'/$I'+x, netD/tm); else outN++; }
+        outside=netD*outN/tm;
+        if(outN) formula(wsS,row,10,'$'+colNet+x+'*'+outN+'/$I'+x, outside); else put(wsS,row,10,{t:'z'});
+      } else {
+        put(wsS,row,8,{t:'z'});
+        if(bm&&mIdx[bm]!=null){ formula(wsS,row,C0+mIdx[bm],'$'+colNet+x, netD); put(wsS,row,10,{t:'z'}); }
+        else { formula(wsS,row,10,'$'+colNet+x, netD); outside=netD; }
+      }
+      formula(wsS,row,C0+m,'SUM('+colOut+x+':'+colL(C0+m-1)+x+')', netD);
+    });
+    const tS=F0+lines.length, xT=tS+1;
+    txt(wsS,tS,0,'Total');
+    for(const c of [9,10,...mk.map((_,j)=>C0+j),C0+m]) formula(wsS,tS,c,'SUM('+colL(c)+(F0+1)+':'+colL(c)+tS+')', null);
+    // cached totals
+    const sumCol=c=>lines.reduce((a,l,i)=>{ const cell=wsS[A(F0+i,c)]; return a+((cell&&typeof cell.v==='number')?cell.v:0); },0);
+    for(const c of [9,10,...mk.map((_,j)=>C0+j),C0+m]) wsS[A(tS,c)].v=sumCol(c);
+    // tie-outs
+    txt(wsS,tS+2,0,'Recognized by client, total row'); mk.forEach((k,j)=>formula(wsS,tS+2,C0+j,"'Recognized by client'!"+colL(1+j)+(totRow+1), wsR[A(totRow,1+j)].v));
+    txt(wsS,tS+3,0,'Difference (should be zero)'); mk.forEach((k,j)=>formula(wsS,tS+3,C0+j,colL(C0+j)+xT+'-'+colL(C0+j)+(tS+3), 0));
+    txt(wsS,tS+4,0,'Billed by client, total'); formula(wsS,tS+4,9,"'Billed by client'!"+colL(totCol)+(totRow+1), wsB[A(totRow,totCol)].v);
+    txt(wsS,tS+5,0,'Difference (should be zero)'); formula(wsS,tS+5,9,colNet+xT+'-'+colNet+(tS+5), 0);
+    txt(wsS,tS+7,0,'Month-end MRR (MRR walk)'); mk.forEach((k,j)=>{ const wi=W.findIndex(r=>r.key===k); if(wi>=0) formula(wsS,tS+7,C0+j,"'MRR walk'!I"+(R0+wi+1), W[wi].close); });
+    txt(wsS,tS+8,0,'Recognised less month-end MRR (lines whose term ended inside the month, and first or last months of terms)'); mk.forEach((k,j)=>{ const wi=W.findIndex(r=>r.key===k); if(wi>=0) formula(wsS,tS+8,C0+j,colL(C0+j)+xT+'-'+colL(C0+j)+(tS+8), (wsS[A(tS,C0+j)].v||0)-W[wi].close); });
+    setRange(wsS,tS+9,C0+m+1);
+    wsS['!cols']=[{wch:11},{wch:11},{wch:28},{wch:40},{wch:13},{wch:10},{wch:11},{wch:11},{wch:8},{wch:12},{wch:11},...mk.map(()=>({wch:10})),{wch:12}];
+    wsS['!freeze']={xSplit:4,ySplit:5};
+    XLSX.utils.book_append_sheet(wb,wsS,'Revenue schedule');
   }
 
   // ---- Scope: holds the FX input cell that every monetary formula points at ----
